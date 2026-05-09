@@ -348,6 +348,7 @@
       }
       drawHold();
     }
+    function move(dx) { if (!collide(dx, 0)) pieceX += dx }
     function drop() { if (!collide(0, 1)) pieceY++; else lock() }
     function hardDrop() { while (!collide(0, 1)) pieceY++; lock() }
     function rotateP() { const r = rotate(piece); if (!collide(0, 0, r)) piece = r }
