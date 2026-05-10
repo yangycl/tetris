@@ -7,6 +7,7 @@
   <title>俄羅斯方塊</title>
   <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Orbitron:wght@400;700&display=swap"
     rel="stylesheet">
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
   <style>
     * {
       box-sizing: border-box;
@@ -139,6 +140,60 @@
       display: none !important
     }
 
+    #opp-wrap {
+      display: flex;
+      flex-direction: column;
+      align-items: center
+    }
+
+    #opp-label {
+      font-size: 7px;
+      color: #444;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+      font-family: 'Orbitron', monospace
+    }
+
+    #mp-input {
+      width: 100%;
+      background: #0d0d1a;
+      border: 1px solid #2a2a4a;
+      color: #aaaaff;
+      font-family: 'Orbitron', monospace;
+      font-size: 9px;
+      padding: 7px 6px;
+      border-radius: 4px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      outline: none;
+      margin-bottom: 4px
+    }
+
+    #mp-input::placeholder { color: #333355 }
+    #mp-input:focus { border-color: #4444aa }
+
+    .mp-btn-row { display: flex; gap: 4px }
+    .mp-btn-row button { padding: 8px 2px; font-size: 7px }
+
+    #mp-code-display {
+      font-size: 8px;
+      color: #8888ff;
+      margin-top: 6px;
+      letter-spacing: 1px;
+      text-align: center;
+      word-break: break-all;
+      min-height: 14px
+    }
+
+    #mp-status {
+      font-size: 7px;
+      color: #6666aa;
+      margin-bottom: 8px;
+      letter-spacing: 1px;
+      min-height: 12px
+    }
+
     #keys-hint {
       font-size: 7px;
       color: #33334a;
@@ -156,6 +211,10 @@
         <h2>TETRIS</h2>
         <p>PRESS START</p>
       </div>
+    </div>
+    <div id="opp-wrap" class="hidden">
+      <div id="opp-label">Opponent</div>
+      <canvas id="opp-board" width="160" height="320" style="border:2px solid #2a2a4a;background:#0d0d1a;display:block"></canvas>
     </div>
     <div id="side">
       <div class="panel">
@@ -183,12 +242,23 @@
       <div class="panel" id="keys-hint">
         ← → 移動<br>↑ 旋轉<br>↓ 加速<br>SPC 直落<br>C HOLD
       </div>
+      <div class="panel">
+        <div class="panel-label">MULTIPLAYER</div>
+        <div id="mp-status">未連線</div>
+        <input id="mp-input" type="text" maxlength="8" placeholder="房間代碼" autocomplete="off">
+        <div class="mp-btn-row">
+          <button id="btn-random">隨機</button>
+          <button id="btn-create">建立</button>
+          <button id="btn-join">加入</button>
+        </div>
+        <div id="mp-code-display"></div>
+      </div>
     </div>
   </div>
 
   <script>
     const COLS = 10, ROWS = 20, SZ = 20;
-    const COLORS = ['', '#ff4466', '#ffaa22', '#ffee33', '#44ee66', '#22ccff', '#aa55ff', '#ff6699'];
+    const COLORS = ['', '#ff4466', '#ffaa22', '#ffee33', '#44ee66', '#22ccff', '#aa55ff', '#ff6699', '#556677'];
     const PIECES = [
       null,
       [[1, 1, 1, 1]],
@@ -240,6 +310,7 @@
     function lock() {
       piece.forEach((row, r) => row.forEach((v, c) => { if (v) board[pieceY + r][pieceX + c] = v }));
       clearLines();
+      sendBoard();
       spawn();
     }
 
@@ -260,6 +331,7 @@
         scoreEl.textContent = score;
         levelEl.textContent = level;
         linesEl.textContent = lines;
+        sendGarbage(cleared > 1 ? cleared - 1 : 0);
       }
     }
 
@@ -290,6 +362,13 @@
             drawBlock(ctx, pieceX + c, pieceY + r, COLORS[v]);
           }
         }));
+        if (mpMode && conn && conn.open) {
+          const now = performance.now();
+          if (now - lastBoardSend > 66) { // ~15fps
+            lastBoardSend = now;
+            conn.send({ type: 'board', board: board, piece: piece, pieceX: pieceX, pieceY: pieceY });
+          }
+        }
       }
       ctx.strokeStyle = '#1a1a2e';
       ctx.lineWidth = .5;
@@ -367,6 +446,7 @@
 
     function endGame() {
       running = false;
+      if (mpMode && conn && conn.open) conn.send({ type: 'gameover' });
       overlayH.textContent = 'GAME OVER';
       overlayP.textContent = 'SCORE: ' + score;
       overlay.classList.remove('hidden');
@@ -406,6 +486,209 @@
     board = newBoard(); score = 0; lines = 0; level = 1;
     holdPiece = null; canHold = true; nextPiece = randPiece();
     drawBoard(); drawNext(); drawHold();
+
+    // ===== MULTIPLAYER (WebRTC via PeerJS) =====
+    const OPP_SZ = 16;
+    let peer = null, conn = null, mpMode = false, oppBoard = null, oppGameOver = false;
+    let oppPiece = null, oppPieceX = 0, oppPieceY = 0;
+    let heartbeatTx = null, heartbeatRx = null, lastPing = 0;
+    let lastBoardSend = 0;
+    const oppCanvas = document.getElementById('opp-board');
+    const oppCtx = oppCanvas.getContext('2d');
+    const mpStatus = document.getElementById('mp-status');
+    const mpCodeDisplay = document.getElementById('mp-code-display');
+
+    function sendBoard() {
+      if (mpMode && conn && conn.open) conn.send({
+        type: 'board', board: board,
+        piece: piece, pieceX: pieceX, pieceY: pieceY
+      });
+    }
+
+    function sendGarbage(n) {
+      if (mpMode && conn && conn.open && n > 0) conn.send({ type: 'garbage', n: n });
+    }
+
+    function addGarbage(n) {
+      for (let i = 0; i < n; i++) {
+        board.shift();
+        const hole = Math.floor(Math.random() * COLS);
+        board.push(Array.from({ length: COLS }, (_, c) => c === hole ? 0 : 8));
+      }
+    }
+
+    function drawOppBoard() {
+      oppCtx.clearRect(0, 0, oppCanvas.width, oppCanvas.height);
+      oppCtx.fillStyle = '#0d0d1a';
+      oppCtx.fillRect(0, 0, oppCanvas.width, oppCanvas.height);
+      if (oppBoard) {
+        for (let r = 0; r < ROWS; r++)
+          for (let c = 0; c < COLS; c++)
+            if (oppBoard[r][c]) {
+              oppCtx.fillStyle = COLORS[oppBoard[r][c]] || '#556677';
+              oppCtx.fillRect(c * OPP_SZ + 1, r * OPP_SZ + 1, OPP_SZ - 2, OPP_SZ - 2);
+              oppCtx.fillStyle = 'rgba(255,255,255,0.18)';
+              oppCtx.fillRect(c * OPP_SZ + 1, r * OPP_SZ + 1, OPP_SZ - 2, 3);
+            }
+        if (oppPiece) {
+          oppPiece.forEach((row, r) => row.forEach((v, c) => {
+            if (v) {
+              oppCtx.fillStyle = COLORS[v];
+              oppCtx.fillRect((oppPieceX + c) * OPP_SZ + 1, (oppPieceY + r) * OPP_SZ + 1, OPP_SZ - 2, OPP_SZ - 2);
+              oppCtx.fillStyle = 'rgba(255,255,255,0.18)';
+              oppCtx.fillRect((oppPieceX + c) * OPP_SZ + 1, (oppPieceY + r) * OPP_SZ + 1, OPP_SZ - 2, 3);
+            }
+          }));
+        }
+      }
+      oppCtx.strokeStyle = '#1a1a2e'; oppCtx.lineWidth = .5;
+      for (let r = 0; r <= ROWS; r++) { oppCtx.beginPath(); oppCtx.moveTo(0, r * OPP_SZ); oppCtx.lineTo(COLS * OPP_SZ, r * OPP_SZ); oppCtx.stroke(); }
+      for (let c = 0; c <= COLS; c++) { oppCtx.beginPath(); oppCtx.moveTo(c * OPP_SZ, 0); oppCtx.lineTo(c * OPP_SZ, ROWS * OPP_SZ); oppCtx.stroke(); }
+      if (oppGameOver) {
+        oppCtx.fillStyle = 'rgba(5,5,20,0.82)';
+        oppCtx.fillRect(0, 0, oppCanvas.width, oppCanvas.height);
+        oppCtx.fillStyle = '#8888ff';
+        oppCtx.font = 'bold 10px Orbitron';
+        oppCtx.textAlign = 'center';
+        oppCtx.fillText('GAME', oppCanvas.width / 2, oppCanvas.height / 2 - 8);
+        oppCtx.fillText('OVER', oppCanvas.width / 2, oppCanvas.height / 2 + 8);
+      }
+    }
+
+    function startHeartbeat() {
+      lastPing = Date.now();
+      heartbeatTx = setInterval(() => {
+        if (conn && conn.open) conn.send({ type: 'ping' });
+      }, 2000);
+      heartbeatRx = setInterval(() => {
+        if (Date.now() - lastPing > 9000) handleDisconnect(); // 需連續 4 次 ping 都沒到才斷
+      }, 1000);
+    }
+
+    function stopHeartbeat() {
+      clearInterval(heartbeatTx); heartbeatTx = null;
+      clearInterval(heartbeatRx); heartbeatRx = null;
+    }
+
+    function handleDisconnect() {
+      if (!mpMode) return;
+      stopHeartbeat();
+      mpMode = false;
+      mpStatus.textContent = '對手已離線';
+      document.getElementById('opp-wrap').classList.add('hidden');
+      if (running) {
+        running = false;
+        overlayH.textContent = '對手離線';
+        overlayP.textContent = '連線中斷';
+        overlay.classList.remove('hidden');
+      }
+    }
+
+    function setupConn(c) {
+      conn = c;
+      conn.on('open', () => {
+        mpMode = true;
+        mpStatus.textContent = '✓ 已連線';
+        mpCodeDisplay.textContent = '';
+        document.getElementById('opp-wrap').classList.remove('hidden');
+        oppBoard = newBoard(); oppGameOver = false;
+        drawOppBoard();
+        startHeartbeat();
+        startGame();
+      });
+      conn.on('data', data => {
+        lastPing = Date.now(); // 任何封包都重置計時
+        if (data.type === 'ping') return;
+        if (data.type === 'board') {
+          oppBoard = data.board;
+          oppPiece = data.piece || null;
+          oppPieceX = data.pieceX || 0;
+          oppPieceY = data.pieceY || 0;
+          oppGameOver = false; drawOppBoard();
+        } else if (data.type === 'gameover') {
+          oppGameOver = true; drawOppBoard();
+          if (running) {
+            running = false;
+            overlayH.textContent = 'YOU WIN!';
+            overlayP.textContent = 'OPPONENT LOST';
+            overlay.classList.remove('hidden');
+          }
+        } else if (data.type === 'garbage') {
+          addGarbage(data.n);
+        }
+      });
+      conn.on('close', () => handleDisconnect());
+      conn.on('error', () => handleDisconnect());
+    }
+
+    function destroyPeer() {
+      stopHeartbeat();
+      if (conn) { try { conn.close(); } catch (e) {} conn = null; }
+      if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
+      mpMode = false;
+      document.getElementById('opp-wrap').classList.add('hidden');
+    }
+
+    function randomMatch() {
+      mpStatus.textContent = '搜尋中...';
+      mpCodeDisplay.textContent = '';
+      destroyPeer();
+      const bucket = Math.floor(Date.now() / 20000); // 20 秒時間窗
+      const roomId = 'ttr-rnd-' + bucket;
+      peer = new Peer(roomId, { debug: 0 });
+      peer.on('open', () => {
+        mpStatus.textContent = '等待對手加入...';
+        mpCodeDisplay.textContent = '(隨機配對中)';
+        peer.on('connection', c => setupConn(c));
+      });
+      peer.on('error', err => {
+        if (err.type === 'unavailable-id') {
+          // 已有人在等待，直接連過去
+          peer = new Peer({ debug: 0 });
+          peer.on('open', () => {
+            mpStatus.textContent = '找到對手！連線中...';
+            setupConn(peer.connect(roomId));
+          });
+          peer.on('error', e2 => { mpStatus.textContent = '連線失敗: ' + e2.type; });
+        } else {
+          mpStatus.textContent = '錯誤: ' + err.type;
+        }
+      });
+    }
+
+    function createRoom() {
+      let code = document.getElementById('mp-input').value.trim().toUpperCase();
+      if (!code) code = Math.random().toString(36).slice(2, 7).toUpperCase();
+      document.getElementById('mp-input').value = code;
+      const roomId = 'ttr-room-' + code;
+      destroyPeer();
+      peer = new Peer(roomId, { debug: 0 });
+      peer.on('open', () => {
+        mpStatus.textContent = '等待對手加入...';
+        mpCodeDisplay.textContent = '代碼：' + code;
+        peer.on('connection', c => setupConn(c));
+      });
+      peer.on('error', err => {
+        mpStatus.textContent = err.type === 'unavailable-id' ? '代碼已被使用，換一個' : '錯誤: ' + err.type;
+      });
+    }
+
+    function joinRoom() {
+      const code = document.getElementById('mp-input').value.trim().toUpperCase();
+      if (!code) { mpStatus.textContent = '請輸入房間代碼'; return; }
+      const roomId = 'ttr-room-' + code;
+      destroyPeer();
+      peer = new Peer({ debug: 0 });
+      peer.on('open', () => {
+        mpStatus.textContent = '連線中...';
+        setupConn(peer.connect(roomId));
+      });
+      peer.on('error', err => { mpStatus.textContent = '錯誤: ' + err.type; });
+    }
+
+    document.getElementById('btn-random').onclick = randomMatch;
+    document.getElementById('btn-create').onclick = createRoom;
+    document.getElementById('btn-join').onclick = joinRoom;
   </script>
 </body>
 
